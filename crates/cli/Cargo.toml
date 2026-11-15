@@ -1,0 +1,27 @@
+[package]
+name = "vantage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vantage"
+path = "src/main.rs"
+bench = false
+
+[features]
+default = ["ebpf"]
+ebpf = ["kernguard/ebpf"]
+
+[dependencies]
+vantage-core.workspace = true
+elfinspector.workspace = true
+rootkithunter.workspace = true
+kernguard.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true
+

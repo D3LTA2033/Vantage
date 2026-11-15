@@ -5,6 +5,7 @@ members = [
     "crates/elfinspector",
     "crates/rootkithunter",
     "crates/kernguard",
+    "crates/cli",
 ]
 
 [workspace.package]
