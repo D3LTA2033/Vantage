@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+repository = "https://github.com/D3LTA2033/Vantage"
+license = "MIT"
+
+[workspace.dependencies]
+libc = "0.2.177"
+vantage-core = { path = "crates/core" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
