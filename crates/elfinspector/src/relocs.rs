@@ -4,17 +4,19 @@ use crate::elf::Elf;
 use crate::names;
 use crate::reader::{Class, Reader};
 use crate::symbols::Symbol;
+use std::collections::HashMap;
+use std::sync::Arc;
 use vantage_core::Result;
 
 const MAX_RELOCATIONS: usize = 10_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relocation {
-    pub table: String,
+    pub table: Arc<str>,
     pub offset: u64,
     pub kind: u32,
     pub sym_index: u32,
-    pub symbol: Option<String>,
+    pub symbol: Option<Arc<str>>,
     pub addend: Option<i64>,
 }
 
@@ -47,12 +49,47 @@ struct Ctx<'r, 's> {
     r: Reader<'r>,
     machine: u16,
     syms: &'s [Symbol],
+    names: HashMap<u32, Arc<str>>,
+    keep: bool,
+    max_sym: u32,
     out: Vec<Relocation>,
     truncated: bool,
 }
 
-impl Ctx<'_, '_> {
+impl<'r, 's> Ctx<'r, 's> {
+    fn new(r: Reader<'r>, machine: u16, keep: bool) -> Self {
+        Ctx {
+            r,
+            machine,
+            syms: &[],
+            names: HashMap::new(),
+            keep,
+            max_sym: 0,
+            out: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    fn use_symbols(&mut self, syms: &'s [Symbol]) {
+        self.syms = syms;
+        self.names.clear();
+    }
+
+    fn symbol(&mut self, index: u32) -> Option<Arc<str>> {
+        let syms = self.syms;
+        let s = syms.get(index as usize).filter(|_| index != 0)?;
+        let name = self
+            .names
+            .entry(index)
+            .or_insert_with(|| Arc::from(s.display_name()));
+        Some(Arc::clone(name))
+    }
+
     fn push(&mut self, rel: Relocation) -> bool {
+        self.max_sym = self.max_sym.max(rel.sym_index);
+        if !self.keep {
+            return true;
+        }
         if self.out.len() >= MAX_RELOCATIONS {
             self.truncated = true;
             return false;
@@ -61,7 +98,7 @@ impl Ctx<'_, '_> {
         true
     }
 
-    fn decode(&mut self, table: &str, data: &[u8], format: Format, entsize: u64) {
+    fn decode(&mut self, table: &Arc<str>, data: &[u8], format: Format, entsize: u64) {
         let r = self.r.with_data(data);
         let ws = r.word_size();
         match format {
@@ -86,12 +123,13 @@ impl Ctx<'_, '_> {
                         Class::Elf32 => ((info >> 8) as u32, (info & 0xff) as u32),
                         Class::Elf64 => ((info >> 32) as u32, info as u32),
                     };
-                    let symbol = (sym_index != 0)
-                        .then(|| self.syms.get(sym_index as usize))
-                        .flatten()
-                        .map(Symbol::display_name);
+                    let symbol = if self.keep {
+                        self.symbol(sym_index)
+                    } else {
+                        None
+                    };
                     if !self.push(Relocation {
-                        table: table.to_owned(),
+                        table: Arc::clone(table),
                         offset,
                         kind,
                         sym_index,
@@ -106,7 +144,7 @@ impl Ctx<'_, '_> {
         }
     }
 
-    fn decode_relr(&mut self, table: &str, r: &Reader<'_>) {
+    fn decode_relr(&mut self, table: &Arc<str>, r: &Reader<'_>) {
         let ws = r.word_size();
         let bits = ws * 8 - 1;
         let kind = relative_type(self.machine);
@@ -135,9 +173,9 @@ impl Ctx<'_, '_> {
         }
     }
 
-    fn push_relative(&mut self, table: &str, offset: u64, kind: u32) -> bool {
+    fn push_relative(&mut self, table: &Arc<str>, offset: u64, kind: u32) -> bool {
         self.push(Relocation {
-            table: table.to_owned(),
+            table: Arc::clone(table),
             offset,
             kind,
             sym_index: 0,
@@ -197,26 +235,16 @@ fn dynamic_tables(d: &Dynamic<'_>) -> Vec<Table> {
 }
 
 pub fn max_dynamic_symbol(elf: &Elf<'_>, d: &Dynamic<'_>) -> Option<u64> {
-    let mut ctx = Ctx {
-        r: elf.r,
-        machine: elf.header.machine,
-        syms: &[],
-        out: Vec::new(),
-        truncated: false,
-    };
+    let mut ctx = Ctx::new(elf.r, elf.header.machine, false);
     for t in dynamic_tables(d) {
         if matches!(t.format, Format::Relr) {
             continue;
         }
         if let Some(data) = elf.bytes_at_vaddr(t.addr, t.size) {
-            ctx.decode(t.name, data, t.format, t.entsize);
+            ctx.decode(&Arc::from(t.name), data, t.format, t.entsize);
         }
     }
-    ctx.out
-        .iter()
-        .map(|r| u64::from(r.sym_index))
-        .filter(|&i| i != 0)
-        .max()
+    (ctx.max_sym != 0).then_some(u64::from(ctx.max_sym))
 }
 
 pub fn relocations(
@@ -229,13 +257,7 @@ pub fn relocations(
         .sections
         .iter()
         .any(|s| matches!(s.kind, SHT_REL | SHT_RELA | SHT_RELR));
-    let mut ctx = Ctx {
-        r: elf.r,
-        machine: elf.header.machine,
-        syms: &[],
-        out: Vec::new(),
-        truncated: false,
-    };
+    let mut ctx = Ctx::new(elf.r, elf.header.machine, true);
     if has_sections {
         for s in elf.sections.clone() {
             let format = match s.kind {
@@ -244,21 +266,21 @@ pub fn relocations(
                 SHT_RELR => Format::Relr,
                 _ => continue,
             };
-            ctx.syms = match elf.sections.get(s.link as usize).map(|l| l.kind) {
+            ctx.use_symbols(match elf.sections.get(s.link as usize).map(|l| l.kind) {
                 Some(SHT_DYNSYM) => dynsyms,
                 Some(SHT_SYMTAB) => statics,
                 _ => &[],
-            };
+            });
             match elf.section_data(&s) {
-                Ok(data) => ctx.decode(&s.name, data, format, s.entsize),
+                Ok(data) => ctx.decode(&Arc::from(s.name.as_str()), data, format, s.entsize),
                 Err(e) => elf.warn(format!("relocation section {} unreadable: {e}", s.name)),
             }
         }
     } else if let Some(d) = dynamic {
-        ctx.syms = dynsyms;
+        ctx.use_symbols(dynsyms);
         for t in dynamic_tables(d) {
             match elf.bytes_at_vaddr(t.addr, t.size) {
-                Some(data) => ctx.decode(t.name, data, t.format, t.entsize),
+                Some(data) => ctx.decode(&Arc::from(t.name), data, t.format, t.entsize),
                 None => elf.warn(format!(
                     "{} at {:#x} size {:#x} does not map to file contents",
                     t.name, t.addr, t.size
@@ -286,14 +308,8 @@ mod tests {
             endian: Endian::Little,
             class: Class::Elf64,
         };
-        let mut ctx = Ctx {
-            r,
-            machine: EM_X86_64,
-            syms: &[],
-            out: Vec::new(),
-            truncated: false,
-        };
-        ctx.decode("t", &data, Format::Relr, 8);
+        let mut ctx = Ctx::new(r, EM_X86_64, true);
+        ctx.decode(&Arc::from("t"), &data, Format::Relr, 8);
         ctx.out.iter().map(|r| r.offset).collect()
     }
 

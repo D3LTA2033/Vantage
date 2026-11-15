@@ -1,8 +1,8 @@
 use crate::Global;
 use crate::args::{self, flag, multi};
-use crate::render::{Out, finding_lines, table};
+use crate::render::{self, Out, finding_lines, table};
 use elfinspector::checksec::{Checksec, Kind};
-use elfinspector::{Binary, Context, Symbol, report};
+use elfinspector::{Binary, Context, Relocation, Symbol, report};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use vantage_core::json::{self, Value};
@@ -176,14 +176,16 @@ fn info(rest: &[String], out: &mut Out) -> Result<i32> {
     if let Some(d) = &bin.dynamic {
         out.line("")?;
         out.line(&format!("dynamic ({})", d.source))?;
+        let mut strs = d.strings();
         let rows: Vec<Vec<String>> = d
             .entries
             .iter()
             .map(|e| {
-                let v = match e.tag {
-                    1 | 14 | 15 | 29 => d.string(e.val).unwrap_or_else(|| format!("{:#x}", e.val)),
-                    _ => format!("{:#x}", e.val),
-                };
+                let v = e
+                    .is_string()
+                    .then(|| strs.get(e.val))
+                    .flatten()
+                    .map_or_else(|| format!("{:#x}", e.val), text::from_bytes);
                 vec![e.tag_name(), v]
             })
             .collect();
@@ -361,15 +363,14 @@ fn checksec(rest: &[String], out: &mut Out, g: &Global) -> Result<i32> {
     })
 }
 
-fn sym_row(s: &Symbol) -> Vec<String> {
-    vec![
+fn sym_cells(s: &Symbol) -> [String; 6] {
+    [
         format!("{:#x}", s.value),
         s.size.to_string(),
         s.kind_name().into(),
         s.bind_name().into(),
         s.visibility_name().into(),
         s.shndx_name(),
-        s.display_name(),
     ]
 }
 
@@ -430,12 +431,10 @@ fn symbols(rest: &[String], out: &mut Out) -> Result<i32> {
     let want_static = !p.flag("dynamic") && !p.flag("imports") && !p.flag("exports");
     let want_dynamic = !p.flag("static");
     if want_dynamic {
-        let imports: Vec<&Symbol> = bin.imports().collect();
-        let exports: Vec<&Symbol> = bin.exports().collect();
         sel.extend(bin.dynsyms.iter().filter(|s| {
             s.index != 0
-                && (!p.flag("imports") || imports.contains(s))
-                && (!p.flag("exports") || exports.contains(s))
+                && (!p.flag("imports") || s.is_undefined())
+                && (!p.flag("exports") || s.is_export())
         }));
     }
     if want_static {
@@ -445,36 +444,25 @@ fn symbols(rest: &[String], out: &mut Out) -> Result<i32> {
         sel.retain(|s| s.name.contains(g));
     }
     if out.json {
-        out.value(&Value::Array(
-            sel.iter().map(|s| report::symbol(s)).collect(),
-        ))?;
+        out.array(sel.iter().map(|s| report::symbol(s)))?;
         return Ok(0);
     }
-    let mut table_name = "";
-    let mut rows = Vec::new();
-    let flush = |name: &str, rows: &mut Vec<Vec<String>>, out: &mut Out| -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        out.line(&format!("{name} ({} symbols)", rows.len()))?;
-        for l in table(
-            &["value", "size", "type", "bind", "vis", "ndx", "name"],
-            rows,
-        ) {
-            out.line(&format!("  {l}"))?;
+    let headers = ["value", "size", "type", "bind", "vis", "ndx", "name"];
+    for group in sel.chunk_by(|a, b| a.table == b.table) {
+        let width = render::widths(&headers, group.iter().map(|s| sym_cells(s)));
+        out.line(&format!(
+            "{} ({} symbols)",
+            group[0].table.as_str(),
+            group.len()
+        ))?;
+        out.line(&format!("  {}", render::row(&width, &headers)))?;
+        for s in group {
+            let [value, size, kind, bind, vis, ndx] = sym_cells(s);
+            let cells = [value, size, kind, bind, vis, ndx, s.display_name()];
+            out.line(&format!("  {}", render::row(&width, &cells)))?;
         }
         out.line("")?;
-        rows.clear();
-        Ok(())
-    };
-    for s in sel {
-        if s.table.as_str() != table_name {
-            flush(table_name, &mut rows, out)?;
-            table_name = s.table.as_str();
-        }
-        rows.push(sym_row(s));
     }
-    flush(table_name, &mut rows, out)?;
     Ok(0)
 }
 
@@ -485,33 +473,28 @@ fn relocs(rest: &[String], out: &mut Out) -> Result<i32> {
     let machine = bin.elf.header.machine;
     let relocs = bin.relocations();
     if out.json {
-        out.value(&Value::Array(
-            relocs
-                .iter()
-                .map(|r| report::relocation(r, machine))
-                .collect(),
-        ))?;
+        out.array(relocs.iter().map(|r| report::relocation(r, machine)))?;
         return Ok(0);
     }
-    let rows: Vec<Vec<String>> = relocs
-        .iter()
-        .map(|r| {
-            let target = match (&r.symbol, r.addend) {
-                (Some(s), Some(a)) if a != 0 => format!("{s} {a:+#x}"),
-                (Some(s), _) => s.clone(),
-                (None, Some(a)) => format!("{a:#x}"),
-                (None, None) => String::new(),
-            };
-            vec![
-                r.table.clone(),
-                format!("{:#x}", r.offset),
-                r.type_name(machine),
-                target,
-            ]
-        })
-        .collect();
-    for l in table(&["table", "offset", "type", "symbol/addend"], &rows) {
-        out.line(&l)?;
+    let headers = ["table", "offset", "type", "symbol/addend"];
+    let cells = |r: &Relocation| {
+        [
+            r.table.to_string(),
+            format!("{:#x}", r.offset),
+            r.type_name(machine),
+        ]
+    };
+    let width = render::widths(&headers, relocs.iter().map(cells));
+    out.line(&render::row(&width, &headers))?;
+    for r in &relocs {
+        let target = match (&r.symbol, r.addend) {
+            (Some(s), Some(a)) if a != 0 => format!("{s} {a:+#x}"),
+            (Some(s), _) => s.to_string(),
+            (None, Some(a)) => format!("{a:#x}"),
+            (None, None) => String::new(),
+        };
+        let [table, offset, kind] = cells(r);
+        out.line(&render::row(&width, &[table, offset, kind, target]))?;
     }
     for w in &bin.elf.warnings {
         eprintln!("vantage: warning: {w}");

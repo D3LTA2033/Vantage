@@ -1,6 +1,6 @@
 use crate::consts::*;
 use crate::names;
-use crate::reader::{Class, Endian, Reader, cstr_at};
+use crate::reader::{Class, Endian, Reader, StrTab};
 use vantage_core::{Error, Result, text};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,10 +326,14 @@ impl<'a> Elf<'a> {
             }
             return;
         };
+        let mut strs = StrTab::new(table);
         for s in &mut self.sections {
-            if let Some(name) = cstr_at(table, u64::from(s.name_offset)) {
+            if let Some(name) = strs.get(u64::from(s.name_offset)) {
                 s.name = text::from_bytes(name);
             }
+        }
+        if let Some(w) = strs.limit_warning("section names") {
+            self.warn(w);
         }
     }
 

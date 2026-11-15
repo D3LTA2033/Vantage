@@ -41,6 +41,28 @@ impl Out {
         self.line(&text)
     }
 
+    pub fn array(&mut self, items: impl IntoIterator<Item = Value>) -> Result<()> {
+        let mut buf = String::new();
+        let mut first = true;
+        for v in items {
+            buf.clear();
+            buf.push(if first { '[' } else { ',' });
+            if self.json {
+                buf.push_str("\n  ");
+            }
+            v.write_to(&mut buf, self.json, 1);
+            self.w
+                .write_all(buf.as_bytes())
+                .map_err(|e| Error::io("write output", e))?;
+            first = false;
+        }
+        match (first, self.json) {
+            (true, _) => self.line("[]"),
+            (false, true) => self.line("\n]"),
+            (false, false) => self.line("]"),
+        }
+    }
+
     pub fn json_line(&mut self, v: &Value) -> Result<()> {
         let text = v.to_compact();
         self.line(&text)?;
@@ -52,34 +74,42 @@ impl Out {
     }
 }
 
+pub fn widths<R, S>(headers: &[&str], rows: impl IntoIterator<Item = R>) -> Vec<usize>
+where
+    R: AsRef<[S]>,
+    S: AsRef<str>,
+{
+    let mut width: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for r in rows {
+        for (w, c) in width.iter_mut().zip(r.as_ref()) {
+            *w = (*w).max(c.as_ref().chars().count());
+        }
+    }
+    width
+}
+
+pub fn row<S: AsRef<str>>(width: &[usize], cells: &[S]) -> String {
+    let mut s = String::new();
+    for (i, c) in cells.iter().enumerate() {
+        let c = c.as_ref();
+        s.push_str(c);
+        if i + 1 < cells.len() {
+            let w = width.get(i).copied().unwrap_or(0);
+            s.extend(std::iter::repeat_n(
+                ' ',
+                w.saturating_sub(c.chars().count()) + 2,
+            ));
+        }
+    }
+    s.truncate(s.trim_end().len());
+    s
+}
+
 pub fn table(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
-    let cols = headers.len();
-    let mut width = vec![0usize; cols];
-    for (i, h) in headers.iter().enumerate() {
-        width[i] = h.chars().count();
-    }
-    for r in rows {
-        for (i, c) in r.iter().enumerate().take(cols) {
-            width[i] = width[i].max(c.chars().count());
-        }
-    }
-    let fmt = |cells: Vec<&str>| {
-        let mut s = String::new();
-        for (i, c) in cells.iter().enumerate() {
-            if i + 1 == cells.len() {
-                s.push_str(c);
-            } else {
-                s.push_str(c);
-                s.extend(std::iter::repeat_n(' ', width[i] - c.chars().count() + 2));
-            }
-        }
-        s.trim_end().to_owned()
-    };
-    let mut out = vec![fmt(headers.to_vec())];
-    for r in rows {
-        out.push(fmt(r.iter().map(String::as_str).collect()));
-    }
-    out
+    let width = widths(headers, rows);
+    std::iter::once(row(&width, headers))
+        .chain(rows.iter().map(|r| row(&width, r)))
+        .collect()
 }
 
 pub fn evidence_text(v: &Value) -> Option<String> {

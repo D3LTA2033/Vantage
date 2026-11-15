@@ -119,6 +119,52 @@ pub fn cstr_at(table: &[u8], off: u64) -> Option<&[u8]> {
     Some(&rest[..end])
 }
 
+#[derive(Debug)]
+pub struct StrTab<'a> {
+    data: &'a [u8],
+    budget: usize,
+    cut: bool,
+}
+
+impl<'a> StrTab<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        StrTab {
+            data,
+            budget: data.len().saturating_mul(4).saturating_add(1 << 16),
+            cut: false,
+        }
+    }
+
+    pub fn get(&mut self, off: u64) -> Option<&'a [u8]> {
+        let rest = self.data.get(usize::try_from(off).ok()?..)?;
+        let window = &rest[..rest.len().min(self.budget)];
+        match window.iter().position(|&b| b == 0) {
+            Some(end) => {
+                self.budget -= end + 1;
+                Some(&window[..end])
+            }
+            None => {
+                self.budget -= window.len();
+                self.cut |= window.len() < rest.len();
+                None
+            }
+        }
+    }
+
+    pub fn cut(&self) -> bool {
+        self.cut
+    }
+
+    pub fn limit_warning(&self, what: &str) -> Option<String> {
+        self.cut.then(|| {
+            format!(
+                "{what}: names reference more than four times the {} byte string table; the rest were not read",
+                self.data.len()
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +219,28 @@ mod tests {
         assert_eq!(cstr_at(t, 0), Some(&b""[..]));
         assert_eq!(cstr_at(t, 11), None);
         assert_eq!(cstr_at(t, 100), None);
+    }
+
+    #[test]
+    fn strtab_budget_bounds_repeated_reads() {
+        let mut t = vec![b'A'; 1 << 20];
+        t.push(0);
+        let mut s = StrTab::new(&t);
+        let mut read = 0usize;
+        for _ in 0..1000 {
+            match s.get(0) {
+                Some(n) => read += n.len(),
+                None => break,
+            }
+        }
+        assert_eq!(read, 4 << 20);
+        assert!(s.cut());
+        assert_eq!(s.get(0), None);
+        assert!(s.limit_warning("x").is_some());
+
+        let mut ok = StrTab::new(b"\0libc.so.6\0abc");
+        assert_eq!(ok.get(1), Some(&b"libc.so.6"[..]));
+        assert_eq!(ok.get(11), None);
+        assert!(!ok.cut());
     }
 }

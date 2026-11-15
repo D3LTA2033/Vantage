@@ -141,3 +141,5 @@ graph LR
 ```
 
 The parser borrows the input slice. Every read goes through a bounds-checked `Reader` that handles both classes and both byte orders. Malformed tables become warnings rather than errors where the loader would still run the file. Dynamic information comes from `PT_DYNAMIC`, the same source the loader uses. When section headers are stripped, dynamic symbols and relocations are recovered from the dynamic segment. A test checks that both paths give identical results.
+
+Input size alone does not bound memory, because many records can point at the same bytes. Each string table is therefore read through a reader that stops after four times the table size plus 64 KiB, and reports a warning if it had to stop. Symbol version names are stored once and shared. Relocations share their table name and symbol name instead of copying them. `elf symbols` and `elf relocs` write their output row by row.

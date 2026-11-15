@@ -1,11 +1,11 @@
 use crate::checksec::{Canary, Checksec, Entry, Nx, Relro};
-use crate::consts::*;
 use crate::reader::{Class, Endian};
 use crate::relocs::Relocation;
 use crate::symbols::Symbol;
 use crate::{Binary, Header};
 use std::fmt::Write;
 use vantage_core::json::{self, Value};
+use vantage_core::text;
 
 pub fn hex(v: u64) -> Value {
     Value::Str(format!("{v:#x}"))
@@ -79,6 +79,7 @@ pub fn info(bin: &Binary<'_>) -> Value {
         })
         .collect();
     let dynamic = bin.dynamic.as_ref().map(|d| {
+        let mut strs = d.strings();
         json::obj([
             ("source", d.source.into()),
             ("needed", d.needed.clone().into()),
@@ -93,12 +94,11 @@ pub fn info(bin: &Binary<'_>) -> Value {
                     d.entries
                         .iter()
                         .map(|e| {
-                            let value = match e.tag {
-                                DT_NEEDED | DT_SONAME | DT_RPATH | DT_RUNPATH => {
-                                    d.string(e.val).map_or_else(|| hex(e.val), Value::Str)
-                                }
-                                _ => hex(e.val),
-                            };
+                            let value = e
+                                .is_string()
+                                .then(|| strs.get(e.val))
+                                .flatten()
+                                .map_or_else(|| hex(e.val), |s| text::from_bytes(s).into());
                             json::obj([("tag", e.tag_name().into()), ("value", value)])
                         })
                         .collect(),
@@ -140,7 +140,7 @@ pub fn symbol(s: &Symbol) -> Value {
         ("table", s.table.as_str().into()),
         ("index", s.index.into()),
         ("name", s.name.clone().into()),
-        ("version", s.version.clone().into()),
+        ("version", s.version.as_deref().into()),
         ("value", hex(s.value)),
         ("size", s.size.into()),
         ("type", s.kind_name().into()),
@@ -152,10 +152,10 @@ pub fn symbol(s: &Symbol) -> Value {
 
 pub fn relocation(r: &Relocation, machine: u16) -> Value {
     json::obj([
-        ("table", r.table.clone().into()),
+        ("table", r.table.as_ref().into()),
         ("offset", hex(r.offset)),
         ("type", r.type_name(machine).into()),
-        ("symbol", r.symbol.clone().into()),
+        ("symbol", r.symbol.as_deref().into()),
         ("addend", r.addend.into()),
     ])
 }

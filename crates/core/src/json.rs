@@ -33,6 +33,10 @@ impl Value {
         out
     }
 
+    pub fn write_to(&self, out: &mut String, pretty: bool, level: usize) {
+        self.write(out, pretty.then_some(2), level);
+    }
+
     pub fn get(&self, key: &str) -> Option<&Value> {
         match self {
             Value::Object(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),

@@ -1,11 +1,14 @@
 use crate::consts::*;
 use crate::dynamic::Dynamic;
 use crate::elf::{Elf, Section};
-use crate::reader::{Class, Reader, cstr_at};
+use crate::reader::{Class, Reader, StrTab};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::sync::Arc;
 use vantage_core::{Error, Result, text};
 
 const MAX_SYMBOLS: u64 = 4_000_000;
+const MAX_VERSION_RECORDS: usize = 1 << 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolTable {
@@ -32,7 +35,7 @@ pub struct Symbol {
     pub bind: u8,
     pub visibility: u8,
     pub shndx: u32,
-    pub version: Option<String>,
+    pub version: Option<Arc<str>>,
     pub version_hidden: bool,
     pub table: SymbolTable,
 }
@@ -44,6 +47,10 @@ impl Symbol {
 
     pub fn is_defined(&self) -> bool {
         self.shndx != SHN_UNDEF
+    }
+
+    pub fn is_export(&self) -> bool {
+        self.is_defined() && self.index != 0 && self.bind != STB_LOCAL
     }
 
     pub fn kind_name(&self) -> &'static str {
@@ -112,7 +119,7 @@ fn read_symbols(
     strtab: &[u8],
     shndx_table: Option<&[u8]>,
     table: SymbolTable,
-) -> Result<Vec<Symbol>> {
+) -> Result<(Vec<Symbol>, Option<String>)> {
     let min = sym_size(r.class);
     let entsize = if entsize == 0 { min } else { entsize };
     if entsize < min {
@@ -125,6 +132,7 @@ fn read_symbols(
     }
     let tr = r.with_data(data);
     let xr = shndx_table.map(|d| r.with_data(d));
+    let mut strs = StrTab::new(strtab);
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {
         let off = i * entsize;
@@ -155,7 +163,8 @@ fn read_symbols(
         {
             shndx = x.u32(i * 4).unwrap_or(shndx);
         }
-        let name = cstr_at(strtab, u64::from(name_off))
+        let name = strs
+            .get(u64::from(name_off))
             .map(text::from_bytes)
             .unwrap_or_default();
         out.push(Symbol {
@@ -172,10 +181,14 @@ fn read_symbols(
             table,
         });
     }
-    Ok(out)
+    Ok((out, strs.limit_warning(table.as_str())))
 }
 
-fn table_from_section(elf: &Elf<'_>, sec: &Section, table: SymbolTable) -> Result<Vec<Symbol>> {
+fn table_from_section(
+    elf: &Elf<'_>,
+    sec: &Section,
+    table: SymbolTable,
+) -> Result<(Vec<Symbol>, Option<String>)> {
     let data = elf.section_data(sec)?;
     let strtab = elf
         .sections
@@ -205,42 +218,53 @@ fn table_from_section(elf: &Elf<'_>, sec: &Section, table: SymbolTable) -> Resul
     )
 }
 
-pub fn static_symbols(elf: &Elf<'_>) -> Result<Vec<Symbol>> {
-    match elf.sections.iter().find(|s| s.kind == SHT_SYMTAB) {
-        Some(sec) => table_from_section(elf, sec, SymbolTable::Static),
-        None => Ok(Vec::new()),
+pub fn static_symbols(elf: &mut Elf<'_>) -> Result<Vec<Symbol>> {
+    let Some(sec) = elf.sections.iter().find(|s| s.kind == SHT_SYMTAB).cloned() else {
+        return Ok(Vec::new());
+    };
+    let (syms, warning) = table_from_section(elf, &sec, SymbolTable::Static)?;
+    if let Some(w) = warning {
+        elf.warn(w);
     }
+    Ok(syms)
 }
 
 pub fn dynamic_symbols(elf: &mut Elf<'_>, dynamic: Option<&Dynamic<'_>>) -> Result<Vec<Symbol>> {
-    let mut syms = if let Some(sec) = elf.sections.iter().find(|s| s.kind == SHT_DYNSYM).cloned() {
-        table_from_section(elf, &sec, SymbolTable::Dynamic)?
-    } else if let Some(d) = dynamic {
-        symbols_from_dynamic(elf, d)?
-    } else {
-        Vec::new()
-    };
+    let (mut syms, warning) =
+        if let Some(sec) = elf.sections.iter().find(|s| s.kind == SHT_DYNSYM).cloned() {
+            table_from_section(elf, &sec, SymbolTable::Dynamic)?
+        } else if let Some(d) = dynamic {
+            symbols_from_dynamic(elf, d)?
+        } else {
+            (Vec::new(), None)
+        };
+    if let Some(w) = warning {
+        elf.warn(w);
+    }
     if let Some(d) = dynamic {
         apply_versions(elf, d, &mut syms);
     }
     Ok(syms)
 }
 
-fn symbols_from_dynamic(elf: &mut Elf<'_>, d: &Dynamic<'_>) -> Result<Vec<Symbol>> {
+fn symbols_from_dynamic(
+    elf: &mut Elf<'_>,
+    d: &Dynamic<'_>,
+) -> Result<(Vec<Symbol>, Option<String>)> {
     let Some(symtab) = d.get(DT_SYMTAB) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     let entsize = d.get(DT_SYMENT).unwrap_or(sym_size(elf.r.class));
     let count = match symbol_count(elf, d) {
         Some(c) => c,
         None => {
             elf.warn("dynamic symbol count unknown (no DT_HASH or DT_GNU_HASH); dynsym not read");
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
     };
     let Some(data) = elf.bytes_from_vaddr(symtab) else {
         elf.warn("DT_SYMTAB does not map to file contents");
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     read_symbols(
         &elf.r,
@@ -341,80 +365,117 @@ fn region<'a>(elf: &Elf<'a>, tag_addr: Option<u64>, section_kind: u32) -> Option
     elf.section_data(s).ok()
 }
 
-fn apply_versions(elf: &Elf<'_>, d: &Dynamic<'_>, syms: &mut [Symbol]) {
-    let Some(versym) = region(elf, d.get(DT_VERSYM), SHT_GNU_VERSYM) else {
-        return;
-    };
-    let mut names: HashMap<u16, String> = HashMap::new();
-    if let Some(data) = region(elf, d.get(DT_VERNEED), SHT_GNU_VERNEED) {
-        let count = d.get(DT_VERNEEDNUM).unwrap_or(u64::MAX);
-        read_verneed(elf, d, data, count, &mut names);
-    }
-    if let Some(data) = region(elf, d.get(DT_VERDEF), SHT_GNU_VERDEF) {
-        let count = d.get(DT_VERDEFNUM).unwrap_or(u64::MAX);
-        read_verdef(elf, d, data, count, &mut names);
-    }
-    let r = elf.reader_for(versym);
-    for s in syms.iter_mut() {
-        let Ok(v) = r.u16(s.index as u64 * 2) else {
-            break;
-        };
-        let idx = v & VERSYM_VERSION;
-        if idx <= 1 {
-            continue;
+struct VersionNames<'a> {
+    strs: StrTab<'a>,
+    records: usize,
+    stopped: bool,
+    names: HashMap<u16, Arc<str>>,
+}
+
+impl VersionNames<'_> {
+    fn record(&mut self) -> bool {
+        if self.records == 0 {
+            self.stopped = true;
+            return false;
         }
-        if let Some(name) = names.get(&idx) {
-            s.version = Some(name.clone());
-            s.version_hidden = v & VERSYM_HIDDEN != 0;
+        self.records -= 1;
+        true
+    }
+
+    fn insert(&mut self, index: u16, name: u32) {
+        if let Entry::Vacant(e) = self.names.entry(index & VERSYM_VERSION)
+            && let Some(n) = self.strs.get(u64::from(name))
+        {
+            e.insert(Arc::from(text::from_bytes(n)));
         }
     }
 }
 
-fn read_verneed(
-    elf: &Elf<'_>,
-    d: &Dynamic<'_>,
-    data: &[u8],
-    count: u64,
-    names: &mut HashMap<u16, String>,
-) {
-    let r = elf.reader_for(data);
+fn apply_versions(elf: &mut Elf<'_>, d: &Dynamic<'_>, syms: &mut [Symbol]) {
+    let Some(versym) = region(elf, d.get(DT_VERSYM), SHT_GNU_VERSYM) else {
+        return;
+    };
+    let mut v = VersionNames {
+        strs: StrTab::new(d.strtab),
+        records: MAX_VERSION_RECORDS,
+        stopped: false,
+        names: HashMap::new(),
+    };
+    if let Some(data) = region(elf, d.get(DT_VERNEED), SHT_GNU_VERNEED) {
+        let count = d.get(DT_VERNEEDNUM).unwrap_or(u64::MAX);
+        read_verneed(&elf.reader_for(data), count, &mut v);
+    }
+    if let Some(data) = region(elf, d.get(DT_VERDEF), SHT_GNU_VERDEF) {
+        let count = d.get(DT_VERDEFNUM).unwrap_or(u64::MAX);
+        read_verdef(&elf.reader_for(data), count, &mut v);
+    }
+    if v.stopped {
+        elf.warn(format!(
+            "version tables: stopped after {MAX_VERSION_RECORDS} records"
+        ));
+    }
+    if let Some(w) = v.strs.limit_warning("version names") {
+        elf.warn(w);
+    }
+    let r = elf.reader_for(versym);
+    for s in syms.iter_mut() {
+        let Ok(idx) = r.u16(s.index as u64 * 2) else {
+            break;
+        };
+        let hidden = idx & VERSYM_HIDDEN != 0;
+        let idx = idx & VERSYM_VERSION;
+        if idx <= 1 {
+            continue;
+        }
+        if let Some(name) = v.names.get(&idx) {
+            s.version = Some(Arc::clone(name));
+            s.version_hidden = hidden;
+        }
+    }
+}
+
+const VERNEED_SIZE: u32 = 16;
+const VERNAUX_SIZE: u32 = 16;
+const VERDEF_SIZE: u32 = 20;
+
+fn read_verneed(r: &Reader<'_>, count: u64, v: &mut VersionNames<'_>) {
     let mut off = 0u64;
-    for _ in 0..count.min(4096) {
+    for _ in 0..count {
+        if !v.record() {
+            return;
+        }
         let (Ok(cnt), Ok(aux), Ok(next)) = (r.u16(off + 2), r.u32(off + 8), r.u32(off + 12)) else {
             return;
         };
         let mut aoff = off + u64::from(aux);
-        for _ in 0..cnt.min(4096) {
+        for _ in 0..cnt {
+            if !v.record() {
+                return;
+            }
             let (Ok(other), Ok(name), Ok(anext)) =
                 (r.u16(aoff + 6), r.u32(aoff + 8), r.u32(aoff + 12))
             else {
                 break;
             };
-            if let Some(n) = d.string(u64::from(name)) {
-                names.insert(other & VERSYM_VERSION, n);
-            }
-            if anext == 0 {
+            v.insert(other, name);
+            if anext < VERNAUX_SIZE {
                 break;
             }
             aoff += u64::from(anext);
         }
-        if next == 0 {
+        if next < VERNEED_SIZE {
             return;
         }
         off += u64::from(next);
     }
 }
 
-fn read_verdef(
-    elf: &Elf<'_>,
-    d: &Dynamic<'_>,
-    data: &[u8],
-    count: u64,
-    names: &mut HashMap<u16, String>,
-) {
-    let r = elf.reader_for(data);
+fn read_verdef(r: &Reader<'_>, count: u64, v: &mut VersionNames<'_>) {
     let mut off = 0u64;
-    for _ in 0..count.min(4096) {
+    for _ in 0..count {
+        if !v.record() {
+            return;
+        }
         let (Ok(flags), Ok(ndx), Ok(aux), Ok(next)) = (
             r.u16(off + 2),
             r.u16(off + 4),
@@ -425,11 +486,10 @@ fn read_verdef(
         };
         if flags & 1 == 0
             && let Ok(name) = r.u32(off + u64::from(aux))
-            && let Some(n) = d.string(u64::from(name))
         {
-            names.insert(ndx & VERSYM_VERSION, n);
+            v.insert(ndx, name);
         }
-        if next == 0 {
+        if next < VERDEF_SIZE {
             return;
         }
         off += u64::from(next);
@@ -475,5 +535,69 @@ impl<'s> AddressIndex<'s> {
 
     pub fn is_empty(&self) -> bool {
         self.sorted.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reader::Endian;
+
+    #[test]
+    fn shared_long_name_is_read_within_budget() {
+        let mut strtab = vec![b'A'; 1 << 20];
+        strtab.push(0);
+        let entries = vec![0u8; 24 * 1000];
+        let r = Reader {
+            data: &entries,
+            endian: Endian::Little,
+            class: Class::Elf64,
+        };
+        let (syms, warning) =
+            read_symbols(&r, &entries, 1000, 24, &strtab, None, SymbolTable::Static).unwrap();
+        assert_eq!(syms.len(), 1000);
+        let total: usize = syms.iter().map(|s| s.name.len()).sum();
+        assert!(total <= strtab.len() * 4 + (1 << 16), "{total}");
+        assert!(warning.is_some_and(|w| w.starts_with("symtab: names reference")));
+    }
+
+    #[test]
+    fn version_chains_must_move_forward() {
+        let mut data = vec![0u8; 32];
+        data[2..4].copy_from_slice(&1u16.to_le_bytes());
+        data[8..12].copy_from_slice(&16u32.to_le_bytes());
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        data[16 + 6..16 + 8].copy_from_slice(&2u16.to_le_bytes());
+        data[16 + 8..16 + 12].copy_from_slice(&1u32.to_le_bytes());
+        data[16 + 12..16 + 16].copy_from_slice(&8u32.to_le_bytes());
+        let r = Reader {
+            data: &data,
+            endian: Endian::Little,
+            class: Class::Elf64,
+        };
+        let mut v = VersionNames {
+            strs: StrTab::new(b"\0GLIBC_2.34\0"),
+            records: MAX_VERSION_RECORDS,
+            stopped: false,
+            names: HashMap::new(),
+        };
+        read_verneed(&r, u64::MAX, &mut v);
+        assert_eq!(v.names.get(&2).map(|s| &**s), Some("GLIBC_2.34"));
+        assert_eq!(v.records, MAX_VERSION_RECORDS - 2);
+
+        let mut looping = data.clone();
+        looping[12..16].copy_from_slice(&4u32.to_le_bytes());
+        let r = Reader {
+            data: &looping,
+            ..r
+        };
+        let mut v = VersionNames {
+            strs: StrTab::new(b"\0GLIBC_2.34\0"),
+            records: MAX_VERSION_RECORDS,
+            stopped: false,
+            names: HashMap::new(),
+        };
+        read_verneed(&r, u64::MAX, &mut v);
+        assert_eq!(v.records, MAX_VERSION_RECORDS - 2);
     }
 }

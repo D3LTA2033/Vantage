@@ -1,7 +1,7 @@
 use crate::consts::*;
 use crate::elf::Elf;
 use crate::names;
-use crate::reader::cstr_at;
+use crate::reader::StrTab;
 use vantage_core::{Result, text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +17,10 @@ impl DynEntry {
             .and_then(|t| names::lookup(names::DYNAMIC_TAGS, t))
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{:#x}", self.tag))
+    }
+
+    pub fn is_string(&self) -> bool {
+        matches!(self.tag, DT_NEEDED | DT_SONAME | DT_RPATH | DT_RUNPATH)
     }
 }
 
@@ -42,8 +46,8 @@ impl<'a> Dynamic<'a> {
         self.entries.iter().any(|e| e.tag == tag)
     }
 
-    pub fn string(&self, off: u64) -> Option<String> {
-        cstr_at(self.strtab, off).map(text::from_bytes)
+    pub fn strings(&self) -> StrTab<'a> {
+        StrTab::new(self.strtab)
     }
 
     pub fn bind_now(&self) -> bool {
@@ -94,12 +98,14 @@ impl<'a> Dynamic<'a> {
         if dynamic.strtab.is_empty() && dynamic.has(DT_STRTAB) {
             elf.warn("DT_STRTAB does not map to file contents");
         }
+        let mut strs = dynamic.strings();
         for e in &dynamic.entries {
-            let s = || dynamic.string(e.val);
+            let mut s = || strs.get(e.val).map(text::from_bytes);
             match e.tag {
-                DT_NEEDED => dynamic
-                    .needed
-                    .push(s().unwrap_or_else(|| format!("<bad offset {:#x}>", e.val))),
+                DT_NEEDED => {
+                    let name = s().unwrap_or_else(|| format!("<bad offset {:#x}>", e.val));
+                    dynamic.needed.push(name);
+                }
                 DT_SONAME => dynamic.soname = s(),
                 DT_RPATH => dynamic.rpath.extend(s().into_iter().flat_map(split_path)),
                 DT_RUNPATH => dynamic.runpath.extend(s().into_iter().flat_map(split_path)),
@@ -107,6 +113,9 @@ impl<'a> Dynamic<'a> {
                 DT_FLAGS_1 => dynamic.flags_1 |= e.val,
                 _ => {}
             }
+        }
+        if let Some(w) = strs.limit_warning("dynamic entries") {
+            elf.warn(w);
         }
         Ok(Some(dynamic))
     }

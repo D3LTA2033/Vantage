@@ -4,6 +4,7 @@ use elfinspector::{Binary, Context};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use vantage_core::Severity;
 
 const PROGRAM: &str = r#"
@@ -326,7 +327,7 @@ fn section_less_binary_matches_section_view() {
     assert!(bare.elf.sections.is_empty());
     assert!(!full.elf.sections.is_empty());
 
-    let names = |b: &Binary<'_>| -> Vec<(String, Option<String>)> {
+    let names = |b: &Binary<'_>| -> Vec<(String, Option<Arc<str>>)> {
         b.dynsyms
             .iter()
             .map(|s| (s.name.clone(), s.version.clone()))
@@ -334,7 +335,7 @@ fn section_less_binary_matches_section_view() {
     };
     assert_eq!(names(&full), names(&bare));
 
-    let key = |b: &mut Binary<'_>| -> BTreeSet<(u64, u32, Option<String>)> {
+    let key = |b: &mut Binary<'_>| -> BTreeSet<(u64, u32, Option<Arc<str>>)> {
         b.relocations()
             .into_iter()
             .map(|r| (r.offset, r.kind, r.symbol))

@@ -40,7 +40,7 @@ impl<'a> Binary<'a> {
             elf.warn(format!("dynamic section unusable: {e}"));
             None
         });
-        let symtab = symbols::static_symbols(&elf).unwrap_or_else(|e| {
+        let symtab = symbols::static_symbols(&mut elf).unwrap_or_else(|e| {
             elf.warn(format!("symbol table unusable: {e}"));
             Vec::new()
         });
@@ -84,9 +84,7 @@ impl<'a> Binary<'a> {
     }
 
     pub fn exports(&self) -> impl Iterator<Item = &Symbol> {
-        self.dynsyms
-            .iter()
-            .filter(|s| s.is_defined() && s.index != 0 && s.bind != consts::STB_LOCAL)
+        self.dynsyms.iter().filter(|s| s.is_export())
     }
 }
 
