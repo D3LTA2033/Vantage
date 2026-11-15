@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/elfinspector",
     "crates/rootkithunter",
+    "crates/kernguard",
 ]
 
 [workspace.package]
@@ -18,6 +19,7 @@ libc = "0.2.177"
 vantage-core = { path = "crates/core" }
 elfinspector = { path = "crates/elfinspector" }
 rootkithunter = { path = "crates/rootkithunter" }
+kernguard = { path = "crates/kernguard", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

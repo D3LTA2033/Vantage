@@ -10,6 +10,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernguard"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "vantage-core",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,26 @@
+[package]
+name = "kernguard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[features]
+default = ["ebpf"]
+ebpf = []
+
+[lib]
+bench = false
+
+[dependencies]
+vantage-core.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "events"
+harness = false
