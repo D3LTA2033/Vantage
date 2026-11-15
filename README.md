@@ -78,7 +78,7 @@ Most checks also run as a normal user, with less coverage. What changes with roo
 | privileged ports are not probed by `hidden-ports` | all ports |
 | `monitor`, `trace` refuse to start | eBPF programs load |
 
-Global options: `--json`, `--output FILE` (created with mode 0600, symlinks refused), `--min-severity LEVEL`, `--fail-on LEVEL`. Exit status: 0 success, 1 findings at or above `--fail-on`, 2 usage error, 3 runtime error. `kernguard trace -- CMD` exits with the command's status.
+Global options: `--json`, `--output FILE` (written with mode 0600; symlinks, hard links, non-regular files and files owned by another user are refused), `--min-severity LEVEL`, `--fail-on LEVEL`. Exit status: 0 success, 1 findings at or above `--fail-on`, 2 usage error, 3 runtime error. `kernguard trace -- CMD` exits with the command's status.
 
 `monitor` prints findings at `low` and above by default. Use `--min-severity info` to also see setuid executions and memfd creation.
 

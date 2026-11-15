@@ -1,8 +1,8 @@
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use vantage_core::json::Value;
-use vantage_core::{CheckResult, Error, Finding, Report, Result, Severity, Status};
+use vantage_core::{CheckResult, Error, Finding, Report, Result, Severity, Status, sys};
 
 pub struct Out {
     w: Box<dyn Write>,
@@ -14,16 +14,7 @@ impl Out {
     pub fn open(path: Option<&str>, json: bool, min: Severity) -> Result<Out> {
         let w: Box<dyn Write> = match path {
             None | Some("-") => Box::new(io::BufWriter::new(io::stdout())),
-            Some(p) => Box::new(io::BufWriter::new(
-                OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(p)
-                    .map_err(|e| Error::io(format!("open {p}"), e))?,
-            )),
+            Some(p) => Box::new(io::BufWriter::new(open_private(p)?)),
         };
         Ok(Out { w, json, min })
     }
@@ -72,6 +63,34 @@ impl Out {
     pub fn flush(&mut self) -> Result<()> {
         self.w.flush().map_err(|e| Error::io("write output", e))
     }
+}
+
+fn open_private(p: &str) -> Result<File> {
+    let f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(p)
+        .map_err(|e| Error::io(format!("open {p}"), e))?;
+    let m = f
+        .metadata()
+        .map_err(|e| Error::io(format!("stat {p}"), e))?;
+    let refuse = |why: String| Err(Error::permission(format!("refusing to write {p}: {why}")));
+    if !m.is_file() {
+        return refuse("not a regular file".into());
+    }
+    if m.uid() != sys::euid() {
+        return refuse(format!("owned by uid {}", m.uid()));
+    }
+    if m.nlink() != 1 {
+        return refuse(format!("has {} hard links", m.nlink()));
+    }
+    f.set_permissions(Permissions::from_mode(0o600))
+        .and_then(|()| f.set_len(0))
+        .map_err(|e| Error::io(format!("prepare {p}"), e))?;
+    Ok(f)
 }
 
 pub fn widths<R, S>(headers: &[&str], rows: impl IntoIterator<Item = R>) -> Vec<usize>

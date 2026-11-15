@@ -398,4 +398,40 @@ fn output_file_is_private_and_refuses_symlinks() {
     let out = run(&["--output", link.to_str().unwrap(), "rootkit", "list"]);
     assert_eq!(out.status.code(), Some(3));
     assert!(!dir.join("elsewhere").exists());
+
+    let existing = dir.join("existing.txt");
+    std::fs::write(
+        &existing,
+        "old contents that are longer than the new ones\n".repeat(100),
+    )
+    .unwrap();
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = run(&["--output", existing.to_str().unwrap(), "rootkit", "list"]);
+    assert!(out.status.success());
+    let mode = std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let written = std::fs::read_to_string(&existing).unwrap();
+    assert!(written.starts_with("check") && !written.contains("old contents"));
+
+    let original = dir.join("original.txt");
+    let linked = dir.join("linked.txt");
+    std::fs::write(&original, "keep me").unwrap();
+    std::fs::hard_link(&original, &linked).unwrap();
+    let out = run(&["--output", linked.to_str().unwrap(), "rootkit", "list"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("hard links"));
+    assert_eq!(std::fs::read_to_string(&original).unwrap(), "keep me");
+
+    let fifo = dir.join("fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let started = std::time::Instant::now();
+    let out = run(&["--output", fifo.to_str().unwrap(), "rootkit", "list"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
