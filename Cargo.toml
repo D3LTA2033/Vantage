@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/core",
+    "crates/elfinspector",
 ]
 
 [workspace.package]
@@ -14,6 +15,7 @@ license = "MIT"
 [workspace.dependencies]
 libc = "0.2.177"
 vantage-core = { path = "crates/core" }
+elfinspector = { path = "crates/elfinspector" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

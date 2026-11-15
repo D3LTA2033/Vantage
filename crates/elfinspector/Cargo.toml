@@ -1,0 +1,20 @@
+[package]
+name = "elfinspector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+bench = false
+
+[dependencies]
+vantage-core.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "elf"
+harness = false
