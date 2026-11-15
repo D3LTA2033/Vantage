@@ -142,6 +142,9 @@ The only crates.io dependency is `libc`. The eBPF program is built by `build.rs`
 - Process, module and socket checks see the current PID and network namespace.
 - aarch64 is covered by the CI workflow on GitHub's arm64 runners. It has not been run on other aarch64 hardware.
 
+## Credits
+@mcs.s Main Programmer
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
