@@ -1,6 +1,6 @@
-use crate::events::{Creds, Event, Exec, Module, Watch};
+use crate::events::{Creds, Event, Exec, Module, Watch, syscall_name};
 use vantage_core::sys::{CAP_SETUID, cap_names};
-use vantage_core::syscalls::Arch;
+use vantage_core::syscalls::{ABI_NATIVE, Arch};
 use vantage_core::{Finding, Severity};
 
 const PTRACE_POKETEXT: u64 = 4;
@@ -81,20 +81,14 @@ pub fn creds(e: &Creds, arch: Arch) -> Vec<Finding> {
     if !uid_gain && (cap_gain == 0 || e.new_userns_level > 0) {
         return Vec::new();
     }
-    let name = if e.compat || e.syscall < 0 {
-        None
-    } else {
-        arch.name(e.syscall as u64)
-    };
+    let name = syscall_name(Some(arch), e.abi, e.syscall);
+    let base_name = name.map(|n| match n.strip_suffix("32") {
+        Some(b) if b.starts_with("set") => b,
+        _ => n,
+    });
     let had_setuid = e.old_cap_eff & (1 << CAP_SETUID) != 0;
-    let (sev, title, detail): (Severity, String, &str) = if e.compat {
-        (
-            Severity::Medium,
-            "credentials elevated during a 32-bit compat syscall".into(),
-            "compat syscall numbers are not classified; inspect the process",
-        )
-    } else {
-        match name {
+    let (sev, title, detail): (Severity, String, &str) = {
+        match base_name {
             Some("execve" | "execveat") => (
                 Severity::Info,
                 "privileges gained by executing a setuid or file-capability binary".into(),
@@ -135,28 +129,42 @@ pub fn creds(e: &Creds, arch: Arch) -> Vec<Finding> {
                 format!("credentials elevated during {n}()"),
                 "commit_creds() raised privileges inside a syscall that never changes credentials; this matches kernel exploit payloads such as commit_creds(prepare_kernel_cred(0))",
             ),
-            None => (
+            None if e.syscall < 0 => (
                 Severity::Critical,
                 "credentials elevated outside a syscall".into(),
                 "commit_creds() raised privileges in a user task that was not executing a syscall",
             ),
+            None => (
+                Severity::Medium,
+                format!("credentials elevated during unknown syscall {}", e.syscall),
+                "the syscall number is not in the table vantage was built with for this ABI; inspect the process",
+            ),
         }
     };
-    vec![
-        base(Finding::new(sev, title).detail(detail), &e.h)
-            .evidence(
-                "syscall",
-                name.map_or_else(|| e.syscall.to_string(), str::to_owned),
-            )
-            .evidence("uid_change", format!("{} -> {}", e.old_uid, e.new_uid))
-            .evidence("euid_change", format!("{} -> {}", e.old_euid, e.new_euid))
-            .evidence(
-                "fsuid_change",
-                format!("{} -> {}", e.old_fsuid, e.new_fsuid),
-            )
-            .evidence("caps_gained", cap_names(cap_gain))
-            .evidence("userns_level", e.new_userns_level),
-    ]
+    let f = base(Finding::new(sev, title).detail(detail), &e.h)
+        .evidence(
+            "syscall",
+            name.map_or_else(|| e.syscall.to_string(), str::to_owned),
+        )
+        .evidence("uid_change", format!("{} -> {}", e.old_uid, e.new_uid))
+        .evidence("euid_change", format!("{} -> {}", e.old_euid, e.new_euid))
+        .evidence(
+            "fsuid_change",
+            format!("{} -> {}", e.old_fsuid, e.new_fsuid),
+        )
+        .evidence("caps_gained", cap_names(cap_gain))
+        .evidence("userns_level", e.new_userns_level);
+    vec![with_abi(f, arch, e.abi)]
+}
+
+fn with_abi(f: Finding, arch: Arch, abi: u32) -> Finding {
+    if abi == ABI_NATIVE {
+        return f;
+    }
+    let shown = arch
+        .abi(abi)
+        .map_or_else(|| format!("unknown ({abi})"), |a| a.as_str().to_owned());
+    f.evidence("abi", shown)
 }
 
 pub fn module(e: &Module) -> Vec<Finding> {
@@ -183,7 +191,7 @@ pub fn module(e: &Module) -> Vec<Finding> {
 }
 
 pub fn watch(e: &Watch, arch: Arch) -> Vec<Finding> {
-    let Some(name) = u64::try_from(e.nr).ok().and_then(|n| arch.name(n)) else {
+    let Some(name) = syscall_name(Some(arch), e.abi, e.nr) else {
         return Vec::new();
     };
     let a = e.args;
@@ -215,7 +223,11 @@ pub fn watch(e: &Watch, arch: Arch) -> Vec<Finding> {
             .detail("a new kernel image is being staged to replace the running kernel"),
         _ => return Vec::new(),
     };
-    vec![base(f, &e.h).evidence("syscall", name)]
+    vec![with_abi(
+        base(f, &e.h).evidence("syscall", name),
+        arch,
+        e.abi,
+    )]
 }
 
 #[cfg(test)]
@@ -249,7 +261,7 @@ mod tests {
             old_cap_prm: 0,
             new_cap_eff: if new == 0 { 0x1ff_ffff_ffff } else { 0 },
             new_userns_level: 0,
-            compat: false,
+            abi: 0,
         }
     }
 
@@ -303,8 +315,49 @@ mod tests {
         let mut e = creds_ev("execve", 1000, 0);
         e.syscall = i64::from(Arch::Aarch64.number("execve").unwrap());
         assert_eq!(creds(&e, Arch::Aarch64)[0].severity, Severity::Info);
-        e.compat = true;
-        assert_eq!(creds(&e, Arch::Aarch64)[0].severity, Severity::Medium);
+        e.abi = 1;
+        let f = creds(&e, Arch::Aarch64);
+        assert_eq!(f[0].severity, Severity::Critical);
+        assert_eq!(
+            f[0].evidence_value("syscall").and_then(|v| v.as_str()),
+            Some("fcntl64")
+        );
+        e.syscall = i64::from(Arch::Arm.number("execve").unwrap());
+        let f = creds(&e, Arch::Aarch64);
+        assert_eq!(f[0].severity, Severity::Info);
+        assert_eq!(
+            f[0].evidence_value("abi").and_then(|v| v.as_str()),
+            Some("arm")
+        );
+    }
+
+    #[test]
+    fn compat_numbers_classify() {
+        let mut e = creds_ev("execve", 1000, 0);
+        e.abi = 1;
+        e.syscall = i64::from(Arch::I386.number("setuid32").unwrap());
+        let f = creds(&e, Arch::X86_64);
+        assert_eq!(f[0].severity, Severity::Critical);
+        assert!(f[0].title.contains("setuid()"), "{}", f[0].title);
+        e.old_cap_eff = 1 << CAP_SETUID;
+        assert_eq!(creds(&e, Arch::X86_64)[0].severity, Severity::Info);
+        e.abi = 2;
+        e.syscall = i64::from(Arch::X32.number("ptrace").unwrap());
+        let f = creds(&e, Arch::X86_64);
+        assert_eq!(f[0].severity, Severity::Critical);
+        assert_eq!(
+            f[0].evidence_value("abi").and_then(|v| v.as_str()),
+            Some("x32")
+        );
+        e.abi = 0;
+        e.syscall = 999;
+        assert_eq!(creds(&e, Arch::X86_64)[0].severity, Severity::Medium);
+        assert!(creds_ev("execve", 1000, 0).abi == 0);
+        assert!(
+            creds(&creds_ev("execve", 1000, 0), Arch::X86_64)[0]
+                .evidence_value("abi")
+                .is_none()
+        );
     }
 
     #[test]
@@ -342,6 +395,7 @@ mod tests {
         let mk = |n: &str, a0: u64| Watch {
             h: h(),
             nr: nr(n),
+            abi: 0,
             args: [a0, 4242, 0, 0, 0, 0],
             path: String::new(),
         };
@@ -368,6 +422,20 @@ mod tests {
             assert!(Arch::X86_64.number(name).is_some(), "{name}");
             assert!(Arch::Aarch64.number(name).is_some(), "{name}");
         }
+
+        let compat = Watch {
+            nr: i64::from(Arch::I386.number("ptrace").unwrap()),
+            abi: 1,
+            ..mk("read", PTRACE_ATTACH)
+        };
+        let f = watch(&compat, Arch::X86_64);
+        assert_eq!(f[0].severity, Severity::Medium);
+        assert_eq!(
+            f[0].evidence_value("abi").and_then(|v| v.as_str()),
+            Some("i386")
+        );
+        let msync = Watch { abi: 0, ..compat };
+        assert!(watch(&msync, Arch::X86_64).is_empty());
     }
 
     #[test]

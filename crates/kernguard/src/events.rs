@@ -1,4 +1,5 @@
 use vantage_core::json::{self, Value};
+use vantage_core::syscalls::Arch;
 use vantage_core::text;
 
 pub const EV_EXEC: u32 = 1;
@@ -10,8 +11,8 @@ pub const EV_WATCH: u32 = 5;
 pub const HDR_SIZE: usize = 40;
 pub const EXEC_SIZE: usize = 376;
 pub const CREDS_SIZE: usize = 112;
-pub const SYSCALL_SIZE: usize = 368;
-pub const WATCH_SIZE: usize = 352;
+pub const SYSCALL_SIZE: usize = 376;
+pub const WATCH_SIZE: usize = 360;
 pub const MODULE_SIZE: usize = 104;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,13 +50,14 @@ pub struct Creds {
     pub old_cap_prm: u64,
     pub new_cap_eff: u64,
     pub new_userns_level: u32,
-    pub compat: bool,
+    pub abi: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Syscall {
     pub h: Header,
     pub nr: i64,
+    pub abi: u32,
     pub args: [u64; 6],
     pub ret: i64,
     pub duration_ns: u64,
@@ -66,8 +68,13 @@ pub struct Syscall {
 pub struct Watch {
     pub h: Header,
     pub nr: i64,
+    pub abi: u32,
     pub args: [u64; 6],
     pub path: String,
+}
+
+pub fn syscall_name(arch: Option<Arch>, abi: u32, nr: i64) -> Option<&'static str> {
+    arch?.abi(abi)?.name(u64::try_from(nr).ok()?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,11 +170,12 @@ pub fn parse(data: &[u8]) -> Option<Event> {
             old_cap_prm: b.u64(88)?,
             new_cap_eff: b.u64(96)?,
             new_userns_level: b.u32(104)?,
-            compat: b.u32(108)? != 0,
+            abi: b.u32(108)?,
         }),
         EV_SYSCALL => Event::Syscall(Syscall {
             h,
             nr: b.i64(40)?,
+            abi: b.u32(368)?,
             args: b.args(48)?,
             ret: b.i64(96)?,
             duration_ns: b.u64(104)?,
@@ -176,6 +184,7 @@ pub fn parse(data: &[u8]) -> Option<Event> {
         EV_WATCH => Event::Watch(Watch {
             h,
             nr: b.i64(40)?,
+            abi: b.u32(352)?,
             args: b.args(48)?,
             path: b.str(96, 256)?,
         }),
@@ -208,7 +217,13 @@ impl Event {
         }
     }
 
-    pub fn to_json(&self, syscall_name: impl Fn(i64) -> Option<&'static str>) -> Value {
+    pub fn to_json(&self, arch: Option<Arch>) -> Value {
+        let syscall =
+            |abi: u32, nr: i64| syscall_name(arch, abi, nr).map_or(Value::from(nr), Value::from);
+        let abi_name = |abi: u32| {
+            arch.and_then(|a| a.abi(abi))
+                .map_or(Value::from(abi), |a| a.as_str().into())
+        };
         let h = self.header();
         let mut pairs: Vec<(String, Value)> = vec![
             ("type".into(), self.kind().into()),
@@ -230,11 +245,8 @@ impl Event {
                 add("nlink", e.nlink.into());
             }
             Event::Creds(e) => {
-                add(
-                    "syscall",
-                    syscall_name(e.syscall).map_or(Value::from(e.syscall), Value::from),
-                );
-                add("compat", e.compat.into());
+                add("syscall", syscall(e.abi, e.syscall));
+                add("abi", abi_name(e.abi));
                 add(
                     "old",
                     json::obj([
@@ -259,20 +271,16 @@ impl Event {
                 );
             }
             Event::Syscall(e) => {
-                add(
-                    "syscall",
-                    syscall_name(e.nr).map_or(Value::from(e.nr), Value::from),
-                );
+                add("syscall", syscall(e.abi, e.nr));
+                add("abi", abi_name(e.abi));
                 add("args", hex_args(&e.args));
                 add("path", (!e.path.is_empty()).then(|| e.path.clone()).into());
                 add("ret", e.ret.into());
                 add("duration_ns", e.duration_ns.into());
             }
             Event::Watch(e) => {
-                add(
-                    "syscall",
-                    syscall_name(e.nr).map_or(Value::from(e.nr), Value::from),
-                );
+                add("syscall", syscall(e.abi, e.nr));
+                add("abi", abi_name(e.abi));
                 add("args", hex_args(&e.args));
                 add("path", (!e.path.is_empty()).then(|| e.path.clone()).into());
             }
@@ -334,7 +342,13 @@ pub mod tests {
         assert_eq!(c.syscall, 59);
         assert_eq!(c.old_euid, 1000);
         assert_eq!(c.new_cap_eff, u64::MAX);
-        assert!(c.compat);
+        assert_eq!(c.abi, 1);
+        let v = Event::Creds(c).to_json(Some(Arch::X86_64));
+        assert_eq!(v.get("abi").and_then(Value::as_str), Some("i386"));
+        assert_eq!(
+            v.get("syscall").and_then(Value::as_str),
+            Some("oldolduname")
+        );
     }
 
     #[test]
@@ -345,22 +359,38 @@ pub mod tests {
         b[96..104].copy_from_slice(&(-2i64).to_ne_bytes());
         b[104..112].copy_from_slice(&5000u64.to_ne_bytes());
         b[112..123].copy_from_slice(b"/etc/shadow");
+        b[368..372].copy_from_slice(&2u32.to_ne_bytes());
         let Some(Event::Syscall(s)) = parse(&b) else {
             panic!()
         };
         assert_eq!(
-            (s.nr, s.args[1], s.ret, s.duration_ns),
-            (257, 0xdead, -2, 5000)
+            (s.nr, s.args[1], s.ret, s.duration_ns, s.abi),
+            (257, 0xdead, -2, 5000, 2)
         );
         assert_eq!(s.path, "/etc/shadow");
+        assert_eq!(
+            syscall_name(Some(Arch::X86_64), s.abi, s.nr),
+            Some("openat")
+        );
+        assert_eq!(syscall_name(Some(Arch::Aarch64), s.abi, s.nr), None);
 
         let mut w = header_bytes(EV_WATCH, WATCH_SIZE);
-        w[40..48].copy_from_slice(&101i64.to_ne_bytes());
+        w[40..48].copy_from_slice(&26i64.to_ne_bytes());
         w[48..56].copy_from_slice(&16u64.to_ne_bytes());
+        w[352..356].copy_from_slice(&1u32.to_ne_bytes());
         let Some(Event::Watch(w)) = parse(&w) else {
             panic!()
         };
-        assert_eq!((w.nr, w.args[0]), (101, 16));
+        assert_eq!((w.nr, w.args[0], w.abi), (26, 16, 1));
+        assert_eq!(
+            syscall_name(Some(Arch::X86_64), w.abi, w.nr),
+            Some("ptrace")
+        );
+        assert_eq!(
+            syscall_name(Some(Arch::Aarch64), w.abi, w.nr),
+            Some("ptrace")
+        );
+        assert_eq!(syscall_name(Some(Arch::X86_64), 0, w.nr), Some("msync"));
     }
 
     #[test]

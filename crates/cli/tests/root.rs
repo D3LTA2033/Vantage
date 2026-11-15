@@ -42,6 +42,20 @@ int main(int argc, char **argv)
         waitpid(c, 0, 0);
         return 0;
     }
+#if defined(__x86_64__)
+    if (argc > 1 && strcmp(argv[1], "ia32") == 0) {
+        char *low = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+        if (low == MAP_FAILED)
+            return 4;
+        strcpy(low, "vantage-ia32");
+        long ret;
+        __asm__ volatile("int $0x80"
+                         : "=a"(ret)
+                         : "a"(356L), "b"(low), "c"(0L)
+                         : "r8", "r9", "r10", "r11", "memory");
+        return ret >= 0 ? 0 : 5;
+    }
+#endif
     return 3;
 }
 "#;
@@ -152,6 +166,33 @@ fn monitor_detects_memfd_exec_and_ptrace() {
         findings
             .iter()
             .any(|f| title(f).starts_with("ptrace attach to pid"))
+    );
+}
+
+#[test]
+#[ignore = "needs root: loads eBPF programs"]
+#[cfg(target_arch = "x86_64")]
+fn monitor_decodes_ia32_syscalls_from_64_bit_code() {
+    let helper = helper();
+    let child = start_monitor("3");
+    let status = Command::new(&helper).arg("ia32").status().unwrap();
+    let findings = monitor_findings(child);
+    assert!(
+        status.success(),
+        "int 0x80 memfd_create failed ({status}); the kernel needs IA32 emulation"
+    );
+    let f = findings
+        .iter()
+        .find(|f| evidence(f, "abi").and_then(Value::as_str) == Some("i386"))
+        .unwrap_or_else(|| panic!("{:?}", findings.iter().map(title).collect::<Vec<_>>()));
+    assert_eq!(title(f), "anonymous memory file created");
+    assert_eq!(
+        evidence(f, "syscall").and_then(Value::as_str),
+        Some("memfd_create")
+    );
+    assert_eq!(
+        evidence(f, "name").and_then(Value::as_str),
+        Some("vantage-ia32")
     );
 }
 

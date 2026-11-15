@@ -1,11 +1,12 @@
 use crate::Global;
 use crate::args::{self, flag, multi, opt};
 use crate::render::{Out, evidence_text, table};
-use kernguard::events::{Event, Syscall};
+use kernguard::events::{Event, Syscall, syscall_name};
 use kernguard::{MonitorOptions, Target, TraceOptions, Tracer, audit, caps};
 use std::path::PathBuf;
 use std::time::Duration;
 use vantage_core::json::{self, Value};
+use vantage_core::syscalls::ABI_NATIVE;
 use vantage_core::{Error, Finding, Report, Result, Severity, sys};
 
 pub const HELP: &str = "usage: vantage kernguard <command>
@@ -126,7 +127,7 @@ fn finding_line(f: &Finding) -> String {
 }
 
 fn event_line(e: &Event, arch: Option<vantage_core::syscalls::Arch>) -> String {
-    let v = e.to_json(|nr| arch.and_then(|a| u64::try_from(nr).ok().and_then(|n| a.name(n))));
+    let v = e.to_json(arch);
     let mut parts = Vec::new();
     if let Value::Object(pairs) = v {
         for (k, val) in pairs {
@@ -152,7 +153,6 @@ fn monitor_cmd(rest: &[String], g: &Global) -> Result<i32> {
     let arch = vantage_core::syscalls::Arch::native();
     let mut worst: Option<Severity> = None;
     let mut write_err = None;
-    let name = |nr: i64| arch.and_then(|a| u64::try_from(nr).ok().and_then(|n| a.name(n)));
     let stats = kernguard::monitor(
         &opts,
         |detectors| {
@@ -180,7 +180,7 @@ fn monitor_cmd(rest: &[String], g: &Global) -> Result<i32> {
                         out.json_line(&json::obj([
                             ("kind", "event".into()),
                             ("unix_ns", kernguard::boot_to_unix_ns(ts).into()),
-                            ("event", event.to_json(name)),
+                            ("event", event.to_json(arch)),
                         ]))?;
                     } else {
                         out.line(&format!("{} {}", clock(ts), event_line(event, arch)))?;
@@ -196,7 +196,7 @@ fn monitor_cmd(rest: &[String], g: &Global) -> Result<i32> {
                             ("kind", "finding".into()),
                             ("unix_ns", kernguard::boot_to_unix_ns(ts).into()),
                             ("finding", f.to_json()),
-                            ("event", event.to_json(name)),
+                            ("event", event.to_json(arch)),
                         ]))?;
                     } else {
                         out.line(&format!("{} {}", clock(ts), finding_line(f)))?;
@@ -274,10 +274,15 @@ fn format_arg(v: u64, ty: Option<&str>, name: Option<&str>, path: Option<&str>) 
 }
 
 fn syscall_line(t: &Tracer, s: &Syscall) -> String {
-    let nr = u32::try_from(s.nr).ok();
-    let name = nr
-        .and_then(|n| t.arch.name(u64::from(n)))
+    let native = s.abi == ABI_NATIVE;
+    let nr = u32::try_from(s.nr).ok().filter(|_| native);
+    let name = syscall_name(Some(t.arch), s.abi, s.nr)
         .map_or_else(|| format!("syscall_{}", s.nr), str::to_owned);
+    let name = match t.arch.abi(s.abi) {
+        _ if native => name,
+        Some(a) => format!("{}:{name}", a.as_str()),
+        None => format!("abi{}:{name}", s.abi),
+    };
     let path_idx = nr.and_then(|n| t.signatures.path_index(n));
     let count = nr
         .and_then(|n| t.signatures.arg_count(n))
@@ -334,9 +339,7 @@ fn trace_cmd(rest: &[String], g: &Global) -> Result<i32> {
         }
         let res = if out.json {
             let ev = Event::Syscall(s.clone());
-            out.json_line(
-                &ev.to_json(|nr| u64::try_from(nr).ok().and_then(|n| tracer.arch.name(n))),
-            )
+            out.json_line(&ev.to_json(Some(tracer.arch)))
         } else {
             out.line(&syscall_line(tracer, s))
         };
@@ -391,5 +394,39 @@ mod tests {
             "\"/etc/passwd\""
         );
         assert_eq!(format_arg(255, None, None, None), "0xff");
+    }
+
+    #[test]
+    fn compat_trace_lines_name_the_abi() {
+        use kernguard::events::Header;
+        use vantage_core::syscalls::Arch;
+        let t = Tracer {
+            signatures: Default::default(),
+            arch: Arch::X86_64,
+        };
+        let mut s = Syscall {
+            h: Header {
+                pid: 7,
+                tgid: 7,
+                uid: 0,
+                ts: 0,
+                comm: "a.out".into(),
+            },
+            nr: 26,
+            abi: 1,
+            args: [16, 4242, 0, 0, 0, 0],
+            ret: 0,
+            duration_ns: 1000,
+            path: "/etc/shadow".into(),
+        };
+        let line = syscall_line(&t, &s);
+        assert!(line.starts_with("[7] i386:ptrace(0x10, 0x1092,"), "{line}");
+        assert!(!line.contains("shadow"), "{line}");
+        s.abi = 2;
+        s.nr = 521;
+        assert!(syscall_line(&t, &s).starts_with("[7] x32:ptrace("));
+        s.abi = 0;
+        s.nr = 26;
+        assert!(syscall_line(&t, &s).starts_with("[7] msync("));
     }
 }

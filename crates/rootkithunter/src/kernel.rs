@@ -112,6 +112,7 @@ fn syscall_prefixes(arch: Arch) -> &'static [&'static str] {
     match arch {
         Arch::X86_64 => &["__x64_sys_", "sys_ni_syscall"],
         Arch::Aarch64 => &["__arm64_sys_", "sys_ni_syscall"],
+        Arch::I386 | Arch::X32 | Arch::Arm => &[],
     }
 }
 

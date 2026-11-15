@@ -12,6 +12,11 @@ char LICENSE[] SEC("license") = "Dual MIT/GPL";
 #define PF_KTHREAD 0x00200000
 #define FLAG_WATCH 1u
 #define FLAG_TRACE 2u
+#define ABI_NATIVE 0u
+#define ABI_COMPAT 1u
+#define ABI_X32 2u
+#define ABI_COUNT 3u
+#define X32_SYSCALL_BIT 0x40000000
 
 enum event_kind {
 	EV_EXEC = 1,
@@ -90,9 +95,12 @@ struct module {
 
 #if defined(__TARGET_ARCH_x86)
 struct pt_regs {
-	unsigned long di;
-	unsigned long si;
+	unsigned long bx;
+	unsigned long cx;
 	unsigned long dx;
+	unsigned long si;
+	unsigned long di;
+	unsigned long bp;
 	unsigned long r10;
 	unsigned long r8;
 	unsigned long r9;
@@ -144,7 +152,7 @@ struct creds_event {
 	__u64 old_cap_prm;
 	__u64 new_cap_eff;
 	__u32 new_userns_level;
-	__u32 compat;
+	__u32 abi;
 };
 
 struct syscall_event {
@@ -154,6 +162,8 @@ struct syscall_event {
 	__s64 ret;
 	__u64 duration;
 	char path[PATH_LEN];
+	__u32 abi;
+	__u32 pad;
 };
 
 struct watch_event {
@@ -161,6 +171,8 @@ struct watch_event {
 	__s64 nr;
 	__u64 args[6];
 	char path[PATH_LEN];
+	__u32 abi;
+	__u32 pad;
 };
 
 struct module_event {
@@ -174,6 +186,8 @@ struct inflight {
 	__u64 ts;
 	__u64 args[6];
 	char path[PATH_LEN];
+	__u32 abi;
+	__u32 pad;
 };
 
 struct config {
@@ -184,10 +198,13 @@ struct config {
 _Static_assert(sizeof(struct hdr) == 40, "hdr layout");
 _Static_assert(sizeof(struct exec_event) == 376, "exec layout");
 _Static_assert(sizeof(struct creds_event) == 112, "creds layout");
-_Static_assert(sizeof(struct syscall_event) == 368, "syscall layout");
-_Static_assert(sizeof(struct watch_event) == 352, "watch layout");
+_Static_assert(sizeof(struct syscall_event) == 376, "syscall layout");
+_Static_assert(sizeof(struct watch_event) == 360, "watch layout");
 _Static_assert(sizeof(struct module_event) == 104, "module layout");
 _Static_assert(__builtin_offsetof(struct creds_event, new_cap_eff) == 96, "creds caps offset");
+_Static_assert(__builtin_offsetof(struct creds_event, abi) == 108, "creds abi offset");
+_Static_assert(__builtin_offsetof(struct syscall_event, abi) == 368, "syscall abi offset");
+_Static_assert(__builtin_offsetof(struct watch_event, abi) == 352, "watch abi offset");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -196,7 +213,7 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, MAX_SYSCALL);
+	__uint(max_entries, MAX_SYSCALL * ABI_COUNT);
 	__type(key, __u32);
 	__type(value, __u32);
 } syscall_flags SEC(".maps");
@@ -265,9 +282,18 @@ static __always_inline int is_self(__u32 tgid)
 	return cfg && cfg->self_tgid == tgid;
 }
 
-static __always_inline void read_args(struct pt_regs *regs, __u64 *args)
+static __always_inline void read_args(struct pt_regs *regs, __u64 *args, __u32 abi)
 {
 #if defined(__TARGET_ARCH_x86)
+	if (abi == ABI_COMPAT) {
+		args[0] = (__u32)BPF_CORE_READ(regs, bx);
+		args[1] = (__u32)BPF_CORE_READ(regs, cx);
+		args[2] = (__u32)BPF_CORE_READ(regs, dx);
+		args[3] = (__u32)BPF_CORE_READ(regs, si);
+		args[4] = (__u32)BPF_CORE_READ(regs, di);
+		args[5] = (__u32)BPF_CORE_READ(regs, bp);
+		return;
+	}
 	args[0] = BPF_CORE_READ(regs, di);
 	args[1] = BPF_CORE_READ(regs, si);
 	args[2] = BPF_CORE_READ(regs, dx);
@@ -281,6 +307,11 @@ static __always_inline void read_args(struct pt_regs *regs, __u64 *args)
 	args[3] = BPF_CORE_READ(regs, regs[3]);
 	args[4] = BPF_CORE_READ(regs, regs[4]);
 	args[5] = BPF_CORE_READ(regs, regs[5]);
+	if (abi == ABI_COMPAT) {
+#pragma unroll
+		for (int i = 0; i < 6; i++)
+			args[i] = (__u32)args[i];
+	}
 #endif
 }
 
@@ -315,6 +346,17 @@ static __always_inline __u32 is_compat(struct task_struct *t, struct pt_regs *re
 #else
 	return (BPF_CORE_READ(regs, pstate) & 0x10) != 0;
 #endif
+}
+
+static __always_inline __u32 syscall_abi(struct task_struct *t, struct pt_regs *regs, __s64 *nr)
+{
+#if defined(__TARGET_ARCH_x86)
+	if (*nr >= 0 && (*nr & X32_SYSCALL_BIT)) {
+		*nr &= ~(__s64)X32_SYSCALL_BIT;
+		return ABI_X32;
+	}
+#endif
+	return is_compat(t, regs) ? ABI_COMPAT : ABI_NATIVE;
 }
 
 SEC("tp_btf/sched_process_exec")
@@ -365,8 +407,9 @@ int on_commit_creds(struct pt_regs *ctx)
 		return 0;
 	fill_hdr(&e->h, EV_CREDS, t);
 	struct pt_regs *regs = (struct pt_regs *)bpf_task_pt_regs(t);
-	e->syscall = syscall_nr(regs);
-	e->compat = is_compat(t, regs);
+	__s64 nr = syscall_nr(regs);
+	e->abi = syscall_abi(t, regs, &nr);
+	e->syscall = nr;
 	e->old_uid = ou;
 	e->old_euid = oe;
 	e->old_suid = BPF_CORE_READ(old, suid.val);
@@ -401,10 +444,15 @@ int on_module_load(__u64 *ctx)
 SEC("raw_tracepoint/sys_enter")
 int on_sys_enter(struct bpf_raw_tracepoint_args *ctx)
 {
-	long nr = (long)ctx->args[1];
-	if (nr < 0 || nr >= MAX_SYSCALL)
+	__s64 nr = (__s64)ctx->args[1];
+	if (nr < 0)
 		return 0;
-	__u32 key = (__u32)nr;
+	struct pt_regs *regs = (struct pt_regs *)ctx->args[0];
+	struct task_struct *t = bpf_get_current_task_btf();
+	__u32 abi = syscall_abi(t, regs, &nr);
+	if (nr >= MAX_SYSCALL)
+		return 0;
+	__u32 key = abi * MAX_SYSCALL + (__u32)nr;
 	__u32 *flags = bpf_map_lookup_elem(&syscall_flags, &key);
 	if (!flags)
 		return 0;
@@ -418,14 +466,15 @@ int on_sys_enter(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 	if (is_self(tgid))
 		return 0;
-	struct pt_regs *regs = (struct pt_regs *)ctx->args[0];
 	__u32 path_idx = (f >> 8) & 0xff;
 	if (f & FLAG_WATCH) {
 		struct watch_event *e = reserve(sizeof(*e));
 		if (e) {
-			fill_hdr(&e->h, EV_WATCH, bpf_get_current_task_btf());
+			fill_hdr(&e->h, EV_WATCH, t);
 			e->nr = nr;
-			read_args(regs, e->args);
+			e->abi = abi;
+			e->pad = 0;
+			read_args(regs, e->args, abi);
 			read_path(e->path, e->args, path_idx);
 			bpf_ringbuf_submit(e, 0);
 		}
@@ -436,8 +485,10 @@ int on_sys_enter(struct bpf_raw_tracepoint_args *ctx)
 		if (!in)
 			return 0;
 		in->nr = nr;
+		in->abi = abi;
+		in->pad = 0;
 		in->ts = bpf_ktime_get_boot_ns();
-		read_args(regs, in->args);
+		read_args(regs, in->args, abi);
 		read_path(in->path, in->args, path_idx);
 		bpf_map_update_elem(&inflight, &id, in, BPF_ANY);
 	}
@@ -459,6 +510,8 @@ int on_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 		e->ret = (__s64)ctx->args[1];
 		e->duration = e->h.ts - in->ts;
 		__builtin_memcpy(e->path, in->path, sizeof(e->path));
+		e->abi = in->abi;
+		e->pad = 0;
 		bpf_ringbuf_submit(e, 0);
 	}
 	bpf_map_delete_elem(&inflight, &id);

@@ -83,7 +83,7 @@ The BPF object is compiled by `build.rs` with `clang -target bpf` and embedded i
 
 Program sets per mode:
 
-- `monitor` loads `on_exec`, `on_commit_creds`, `on_module_load` and `on_sys_enter`. `syscall_flags` marks only the watched syscalls, so all other syscalls return after one array lookup.
+- `monitor` loads `on_exec`, `on_commit_creds`, `on_module_load` and `on_sys_enter`. `syscall_flags` has one entry per syscall number for each ABI (native, compat, x32) and marks only the watched syscalls, so all other syscalls return after one array lookup. The ABI comes from the x32 bit of the syscall number, `TS_COMPAT` in `thread_info.status` on x86_64, or the AArch32 bit of `pstate` on arm64. i386 arguments are read from bx, cx, dx, si, di and bp.
 - `trace` loads `on_sys_enter`, `on_sys_exit`, `on_fork` and `on_exit`. The `traced` map starts with the target PID. `on_fork` adds children, and `on_exit` removes processes and stale in-flight entries.
 
 Event layouts are fixed C structs. The C side checks sizes and offsets with `_Static_assert`. The Rust side decodes the bytes at explicit offsets and never transmutes. A per-CPU `drops` counter records ring buffer reservation failures, and the count is printed when the session ends.

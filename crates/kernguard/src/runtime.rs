@@ -10,7 +10,7 @@ use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
-use vantage_core::syscalls::Arch;
+use vantage_core::syscalls::{ABI_NATIVE, Arch};
 use vantage_core::{Error, Finding, Result, rawsys, sys};
 
 #[repr(C, align(8))]
@@ -134,10 +134,16 @@ pub fn monitor(
     let obj = open(&wanted)?;
     let sigs = Signatures::load(arch);
     let flags = obj.map("syscall_flags")?;
-    for name in rules::WATCHED {
-        if let Some(nr) = arch.number(name) {
-            let path = u32::from(sigs.path_index(nr).unwrap_or(0));
-            flags.update(&nr, &(FLAG_WATCH | (path << 8)))?;
+    for (abi, table) in arch.abis() {
+        for name in rules::WATCHED {
+            let Some(nr) = table.number(name) else {
+                continue;
+            };
+            let path = arch
+                .number(name)
+                .and_then(|n| sigs.path_index(n))
+                .map_or(0, u32::from);
+            flags.update(&(abi * MAX_SYSCALL + nr), &(FLAG_WATCH | (path << 8)))?;
         }
     }
     let mut links = Vec::new();
@@ -252,9 +258,15 @@ pub fn trace(opts: &TraceOptions, mut on_syscall: impl FnMut(&Tracer, &Syscall))
         arch,
     };
     let flags = obj.map("syscall_flags")?;
-    for nr in 0..MAX_SYSCALL {
-        let path = u32::from(tracer.signatures.path_index(nr).unwrap_or(0));
-        flags.update(&nr, &(FLAG_TRACE | (path << 8)))?;
+    for (abi, _) in arch.abis() {
+        for nr in 0..MAX_SYSCALL {
+            let path = if abi == ABI_NATIVE {
+                tracer.signatures.path_index(nr).map_or(0, u32::from)
+            } else {
+                0
+            };
+            flags.update(&(abi * MAX_SYSCALL + nr), &(FLAG_TRACE | (path << 8)))?;
+        }
     }
     let links: Vec<_> = ["on_sys_enter", "on_sys_exit", "on_fork", "on_exit"]
         .iter()

@@ -18,7 +18,7 @@ The checks read the inode the kernel actually executes, so renames, `/proc/self/
 
 ### privilege escalation (`kprobe/commit_creds`)
 
-An event is emitted when new credentials raise uid, euid or fsuid to 0, or add effective capabilities. Capability gains inside a non-initial user namespace are ignored, because they do not grant anything on the host. The event records the syscall the task is executing.
+An event is emitted when new credentials raise uid, euid or fsuid to 0, or add effective capabilities. Capability gains inside a non-initial user namespace are ignored, because they do not grant anything on the host. The event records the syscall the task is executing and the ABI it used, and the syscall is looked up in that ABI's table: x86_64, i386 or x32 on x86_64, aarch64 or 32-bit arm on arm64. The i386 and arm `setuid32`-style variants count as their base syscall.
 
 | syscall at the time | result |
 |---|---|
@@ -27,7 +27,7 @@ An event is emitted when new credentials raise uid, euid or fsuid to 0, or add e
 | `capset` | info if the new capabilities were already permitted, otherwise critical |
 | any other syscall | critical: credentials raised inside a syscall that never changes them, the pattern of `commit_creds(prepare_kernel_cred(0))` exploit payloads |
 | no syscall | critical |
-| 32-bit compat syscall | medium: compat syscall numbers are not classified |
+| number not in the table for its ABI | medium: cannot be classified, for example a syscall newer than vantage |
 
 Not covered: exploits that overwrite `struct cred` fields in place instead of calling `commit_creds` (for example DirtyCred-style credential swaps, or direct writes through an arbitrary-write primitive). Kernel threads are skipped.
 
@@ -49,6 +49,8 @@ Every module load is reported with its name and taint bits. Severity is medium, 
 | `kexec_load`, `kexec_file_load` | always | high |
 | `memfd_create` | always, with the memfd name | info |
 
+These syscalls are watched under every ABI the kernel accepts, each with its own numbers: i386 and x32 on x86_64, 32-bit arm on arm64. The ABI is taken from the x32 bit of the syscall number, `TS_COMPAT` on x86_64 and the AArch32 bit of `pstate` on arm64, so a 64-bit program that issues `int 0x80` is decoded as i386, with its arguments read from the i386 registers. Findings for a non-native ABI carry an `abi` evidence field.
+
 Vantage's own process is excluded in the kernel.
 
 ### general limits
@@ -59,7 +61,7 @@ Vantage's own process is excluded in the kernel.
 
 ## KernGuard: tracing (`vantage kernguard trace`)
 
-Records every syscall of a PID, or of a command started by vantage, plus all of its descendants: number, six raw arguments, return value, duration, and the path argument as a string. Argument names and types come from tracefs (`events/syscalls/sys_enter_*/format`) when it is readable. Otherwise a built-in table identifies the path argument of the common file syscalls. Syscalls of threads that already existed when `--pid` attached are traced from their next syscall on.
+Records every syscall of a PID, or of a command started by vantage, plus all of its descendants: number, six raw arguments, return value, duration, and the path argument as a string. Argument names and types come from tracefs (`events/syscalls/sys_enter_*/format`) when it is readable. Otherwise a built-in table identifies the path argument of the common file syscalls. Syscalls of threads that already existed when `--pid` attached are traced from their next syscall on. Compat syscalls (i386, x32, 32-bit arm) are printed with their ABI and name, for example `i386:openat(...)`, and with raw arguments only, because some compat syscalls split 64-bit arguments across two registers and the tracefs signatures describe the native layout.
 
 ## KernGuard: audit (`vantage kernguard audit`)
 
