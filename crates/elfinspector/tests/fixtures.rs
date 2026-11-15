@@ -226,7 +226,13 @@ fn shared_object_exports_and_versions() {
         &compiler,
         "libvantage.so",
         "#include <stdio.h>\nint vantage_export(int x) { printf(\"%d\", x); return x; }\nstatic int hidden(void) { return 1; }\nint (*keep)(void) = hidden;\n",
-        &["-shared", "-fPIC", "-O1", "-Wl,-soname,libvantage.so.1"],
+        &[
+            "-shared",
+            "-fPIC",
+            "-O1",
+            "-U_FORTIFY_SOURCE",
+            "-Wl,-soname,libvantage.so.1",
+        ],
     );
     let bin = Binary::parse(&data).unwrap();
     assert_eq!(bin.checksec().kind, Kind::SharedObject);
@@ -368,9 +374,15 @@ fn patched_segment_flags_are_detected() {
     assert_eq!(c.wx_segments, vec![text.index]);
     assert_eq!(c.entry, Entry::Writable);
 
-    let mut headers = data.clone();
-    headers[24..32].copy_from_slice(&1u64.to_le_bytes());
-    let c = Binary::parse(&headers).unwrap().checksec();
+    let data_seg = bin
+        .elf
+        .segments
+        .iter()
+        .find(|s| s.kind == 1 && s.flags & 1 == 0 && s.memsz > 1)
+        .expect("non-executable load segment");
+    let mut nonexec = data.clone();
+    nonexec[24..32].copy_from_slice(&(data_seg.vaddr + 1).to_le_bytes());
+    let c = Binary::parse(&nonexec).unwrap().checksec();
     assert_eq!(c.entry, Entry::NonExecutable);
 
     let mut moved = data.clone();

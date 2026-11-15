@@ -37,9 +37,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libbpf-dev pkg-config util-linux
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace --all-targets --locked
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --no-fail-fast
       - name: privileged tests (eBPF, kcore, tracefs)
-        run: cargo test --workspace --locked -- --ignored
+        run: cargo test --workspace --locked --no-fail-fast -- --ignored
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
@@ -57,7 +57,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace --locked --no-default-features
+      - run: cargo test --workspace --locked --no-fail-fast --no-default-features
       - run: "! ./target/debug/vantage kernguard monitor --duration 1"
 
   msrv:
