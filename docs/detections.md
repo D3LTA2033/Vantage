@@ -101,4 +101,4 @@ Records every syscall of a PID, or of a command started by vantage, plus all of 
 | CET / BTI / PAC | `GNU_PROPERTY_X86_FEATURE_1_AND` and `GNU_PROPERTY_AARCH64_FEATURE_1_AND` notes |
 | packer | UPX section names or the `UPX!` marker in the first 4 KiB |
 
-Most severities go up one level for setuid/setgid binaries, because those cross a privilege boundary. `vantage scan` runs these checks on every setuid/setgid ELF file found by `privileged-files`.
+Most severities go up one level for setuid/setgid binaries, because those cross a privilege boundary. `vantage scan` runs these checks on every setuid/setgid ELF file found by `privileged-files`. Each file is opened without following symlinks and without blocking, and is read only if it is still the same regular file (device and inode) the walk found. Files replaced in between, for example by a symlink or a FIFO in `/tmp`, are counted in the summary and skipped.

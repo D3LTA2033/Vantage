@@ -396,6 +396,8 @@ fn file_caps(path: &Path) -> Option<FileCaps> {
 #[derive(Debug, Clone)]
 pub struct PrivilegedFile {
     pub path: PathBuf,
+    pub dev: u64,
+    pub ino: u64,
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
@@ -475,6 +477,8 @@ pub fn find_privileged(extra: &[PathBuf]) -> (Vec<PrivilegedFile>, usize) {
             if special || caps.is_some() {
                 out.push(PrivilegedFile {
                     path,
+                    dev: m.dev(),
+                    ino: m.ino(),
                     mode,
                     uid: m.uid(),
                     gid: m.gid(),
@@ -678,6 +682,8 @@ mod tests {
     fn privileged_file_rules() {
         let f = PrivilegedFile {
             path: PathBuf::from("/tmp/.x/bash"),
+            dev: 0,
+            ino: 0,
             mode: 0o104777,
             uid: 0,
             gid: 0,
@@ -688,6 +694,8 @@ mod tests {
         assert!(titles.contains(&Severity::High));
         let py = PrivilegedFile {
             path: PathBuf::from("/usr/bin/python3.12"),
+            dev: 0,
+            ino: 0,
             mode: 0o100755,
             uid: 0,
             gid: 0,

@@ -3,6 +3,9 @@ use crate::args::{self, multi, opt};
 use crate::render::{Out, table};
 use elfinspector::{Binary, Context};
 use kernguard::audit::{self, PrivilegedFile};
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use vantage_core::json::{self, Value};
 use vantage_core::{CheckResult, Error, Finding, Outcome, Report, Result, Severity, sys, text};
@@ -26,15 +29,32 @@ commands:
       --pid-max N    highest PID to probe (default kernel.pid_max)
       --dir DIR      extra directory to compare between libc and raw syscalls (repeatable)";
 
+fn read_walked(f: &PrivilegedFile) -> Option<Vec<u8>> {
+    let max = elfinspector::DEFAULT_MAX_SIZE;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(&f.path)
+        .ok()?;
+    let m = file.metadata().ok()?;
+    if !m.is_file() || m.dev() != f.dev || m.ino() != f.ino || m.len() > max {
+        return None;
+    }
+    let mut data = Vec::with_capacity(m.len() as usize);
+    file.take(max + 1).read_to_end(&mut data).ok()?;
+    (data.len() as u64 <= max).then_some(data)
+}
+
 pub fn setuid_mitigations(found: &[PrivilegedFile]) -> Result<Outcome> {
     let mut findings = Vec::new();
     let mut analyzed = 0usize;
     let mut not_elf = 0usize;
+    let mut changed = 0usize;
     for f in found.iter().filter(|f| f.setuid() || f.setgid()) {
         let shown = text::from_path(&f.path);
-        let data = match elfinspector::read_file(&f.path, elfinspector::DEFAULT_MAX_SIZE) {
-            Ok(d) => d,
-            Err(_) => continue,
+        let Some(data) = read_walked(f) else {
+            changed += 1;
+            continue;
         };
         let Ok(bin) = Binary::parse(&data) else {
             not_elf += 1;
@@ -60,6 +80,11 @@ pub fn setuid_mitigations(found: &[PrivilegedFile]) -> Result<Outcome> {
     let mut summary = format!("{analyzed} setuid/setgid ELF binaries analyzed");
     if not_elf > 0 {
         summary.push_str(&format!(", {not_elf} non-ELF files skipped"));
+    }
+    if changed > 0 {
+        summary.push_str(&format!(
+            ", {changed} skipped because they were replaced, removed or unreadable after the walk"
+        ));
     }
     Ok(Outcome::done(summary, findings))
 }
@@ -202,5 +227,67 @@ pub fn rootkit(argv: &[String], g: &Global) -> Result<i32> {
         other => Err(Error::usage(format!(
             "unknown rootkit command {other:?}\n\n{ROOTKIT_HELP}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::time::{Duration, Instant};
+
+    fn walked(path: &Path) -> PrivilegedFile {
+        let m = std::fs::symlink_metadata(path).unwrap();
+        PrivilegedFile {
+            path: path.to_owned(),
+            dev: m.dev(),
+            ino: m.ino(),
+            mode: m.mode(),
+            uid: m.uid(),
+            gid: m.gid(),
+            caps: None,
+        }
+    }
+
+    #[test]
+    fn walked_file_is_read_only_while_it_is_the_same_inode() {
+        let dir = std::env::temp_dir().join(format!("vantage-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("su");
+        std::fs::write(&path, b"\x7fELF").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        let f = walked(&path);
+        assert_eq!(read_walked(&f).as_deref(), Some(&b"\x7fELF"[..]));
+
+        let other = dir.join("other");
+        std::fs::write(&other, b"secret").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        symlink(&other, &path).unwrap();
+        assert_eq!(read_walked(&f), None);
+
+        std::fs::remove_file(&path).unwrap();
+        let st = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let t = Instant::now();
+        assert_eq!(read_walked(&f), None);
+        assert!(t.elapsed() < Duration::from_secs(2));
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        assert_eq!(read_walked(&f), None);
+
+        let outcome = setuid_mitigations(&[f]).unwrap();
+        let Outcome::Done { summary, .. } = outcome else {
+            panic!("skipped");
+        };
+        assert!(
+            summary.contains("1 skipped because they were replaced"),
+            "{summary}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
